@@ -133,3 +133,11 @@ Clone the repository:
 ```bash
 git clone your-repo-url
 cd allo-inventory-reservation
+
+## Trade-offs
+
+- Redis locking was not used because the database-level atomic conditional update is enough for this focused assignment.
+- Idempotency-Key support was not implemented because it was optional.
+- The UI currently reserves one unit at a time to keep the checkout flow simple.
+- Expired reservation cleanup is implemented using a cron-compatible API endpoint instead of a dedicated background worker.
+- Authentication is not included because the assignment focuses on inventory and reservation correctness.
