@@ -57,3 +57,11 @@ enum ReservationStatus {
   CONFIRMED
   RELEASED
 }
+
+model IdempotencyKey {
+  id         String   @id @default(cuid())
+  key        String   @unique
+  statusCode Int
+  response   String   // JSON string of response payload
+  createdAt  DateTime @default(now())
+}

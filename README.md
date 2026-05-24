@@ -66,78 +66,85 @@ Reservation statuses:
 
 ## Concurrency Strategy
 
-The most important part of this assignment is preventing overselling.
+The most important part of this assignment is preventing inventory overselling under high concurrency. 
 
-The reservation endpoint runs inside a database transaction.
+To solve this, we implemented **pessimistic row locking** at the database layer using PostgreSQL `SELECT ... FOR UPDATE` transactions:
+1. **Reservation holds (`POST /api/reservations`):** When a user requests to hold stock, we immediately lock the corresponding `Stock` row. This blocks concurrent requests for the exact same Product + Warehouse combination. We evaluate the available stock *inside the lock*, decrement it, and create the reservation. Because other requests wait in line, they evaluate the most up-to-date numbers.
+2. **State transitions (`confirm` & `release`):** When confirming or releasing a reservation, we acquire a pessimistic row lock on the `Reservation` row. This prevents race conditions between the customer (e.g., clicking confirm) and background/cron processes (e.g., attempting to expire/release). Only one transaction can change the status from `PENDING`, completely avoiding double-decrementing stock.
+3. **Transaction Queueing:** To handle high-concurrency waiting lines without failure, we configure interactive transaction timeouts to 30 seconds (`timeout: 30000`), letting waiting transactions serialize and process smoothly.
 
-Before creating a reservation, it checks available stock:
+---
 
-availableUnits = totalUnits - reservedUnits
+## Expiry Mechanism & Lazy Cleanup
 
-Then it performs an atomic conditional update on the stock row.
+Reservations expire after **10 minutes**. We use a dual-layer cleanup mechanism:
 
-If two checkout requests arrive at the same time for the last available unit, only one request can successfully increment reservedUnits.
+1. **Lazy Cleanup on Read (Real-Time):** Before querying products or reservations, we trigger a global `lazyCleanup()` utility. It scans for any expired pending reservations, locks their Stock/Reservation rows, and releases the inventory in a single transaction. This guarantees that **stock levels are immediately corrected in real-time** whenever a user visits the catalog or attempts to check out, with zero delay.
+2. **Scheduled Cleanup (Vercel Cron):** We maintain a cron endpoint `/api/cron/release-expired` which runs every 5 minutes in production (configured in `vercel.json`) to clean up abandoned carts in the background.
 
-The second request receives HTTP 409.
+---
 
-This prevents two customers from reserving the same physical unit.
+## Persistent DB-Based Idempotency (Bonus)
 
-## API Routes
+We implemented robust idempotency for both the **Reserve** and **Confirm** endpoints using an `IdempotencyKey` table in PostgreSQL:
+- Clients submit an `Idempotency-Key` header (generated on the client via `crypto.randomUUID()`).
+- The API checks if the key exists. If it does, it immediately returns the cached HTTP response code and JSON payload, completely skipping the side effects.
+- If it's a new key, the API runs the transaction, records the status and JSON response in the database under that key, and returns.
+- This provides transactionally consistent idempotency using our main database as the single source of truth, avoiding the need for an external Redis instance.
 
-### GET /api/products
+---
 
-Lists products with available stock per warehouse.
+## Premium UI & UX
 
-### GET /api/warehouses
+We built a high-fidelity glassmorphic dark-mode dashboard tailored for multi-warehouse retail:
+- **Interactive Stats:** Real-time counters showing SKU catalogs, active warehouses, total units, and active reserved holds.
+- **Custom Quantity Selector:** Customers can choose exact quantities to reserve, backed by live available stock constraints.
+- **Micro-Animations:** Hover glows on cards, pulse indicators for active reservations, and animated loading spinners for pending transactions.
+- **Sleek Reactive Timer:** The countdown timer dynamically changes color based on time left (**Emerald** when > 5m, **Amber** when <= 5m, **Vibrant Pulsing Red** when <= 1m) and renders an animated progress bar.
+- **Auto-Release Transition:** When the timer hits `0:00`, the UI immediately transforms into an "Expired" state and fires a release request in the background, without requiring a page refresh.
+- **Clear Error Modals:** Displays elegant "Transaction Blocked" banners showing 409 (Out of Stock) and 410 (Expired) responses directly to the user.
 
-Lists warehouses.
+---
 
-### POST /api/reservations
+## Local Setup & Verification
 
-Creates a pending reservation.
+### 1. Environment Variables
+Create a `.env` file in the root directory:
+```env
+DATABASE_URL="your-hosted-postgres-url-with-sslmode=require"
+```
 
-Returns 409 if there is not enough stock.
-
-### GET /api/reservations/:id
-
-Fetches a reservation by ID.
-
-### POST /api/reservations/:id/confirm
-
-Confirms the reservation.
-
-If the reservation has expired, it returns 410.
-
-### POST /api/reservations/:id/release
-
-Releases the reservation early.
-
-### GET /api/cron/release-expired
-
-Releases expired pending reservations.
-
-## Expiry Mechanism
-
-Each reservation expires after 10 minutes.
-
-In production, expired reservations can be released using a Vercel Cron job that calls:
-
-/api/cron/release-expired
-
-This endpoint finds pending reservations where expiresAt is in the past, marks them as released, and decrements reservedUnits.
-
-## Local Setup
-
-Clone the repository:
-
+### 2. Install Dependencies
 ```bash
-git clone your-repo-url
-cd allo-inventory-reservation
+npm install
+```
+
+### 3. Sync Database Schema & Generate Prisma Client
+```bash
+npx prisma db push
+npx prisma generate
+```
+
+### 4. Seed Database
+```bash
+npx prisma db seed
+```
+
+### 5. Run Development Server
+```bash
+npm run dev
+```
+Open [http://localhost:3000](http://localhost:3000) in your browser.
+
+### 6. Run Integration Test Suite
+To verify the concurrency and idempotency features:
+```bash
+npx tsx /Users/srithesh/.gemini/antigravity-ide/brain/5af1aa4f-ce6f-410b-85e9-cf33ad48bec6/scratch/scratch_test.ts
+```
+
+---
 
 ## Trade-offs
 
-- Redis locking was not used because the database-level atomic conditional update is enough for this focused assignment.
-- Idempotency-Key support was not implemented because it was optional.
-- The UI currently reserves one unit at a time to keep the checkout flow simple.
-- Expired reservation cleanup is implemented using a cron-compatible API endpoint instead of a dedicated background worker.
-- Authentication is not included because the assignment focuses on inventory and reservation correctness.
+- **PostgreSQL Row Locking vs Redis:** We opted for PostgreSQL database-level row locking (`FOR UPDATE`) instead of Redis distributed locks. Since PostgreSQL is already the transactional database, keeping locks in PostgreSQL maintains ACID compliance, avoids dual-write consistency problems, and eliminates the need for external cache infrastructure.
+- **DB-Based Idempotency Keys:** Storing idempotency keys directly in PostgreSQL keeps the architecture clean and simple to deploy, with zero external dependencies. In a ultra-high scale system, these keys could be offloaded to Redis with a TTL, but for this application, a PostgreSQL table is extremely reliable and persistent.

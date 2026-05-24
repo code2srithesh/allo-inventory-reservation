@@ -1,46 +1,20 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { lazyCleanup } from "@/lib/lazy-cleanup";
 
 export async function GET() {
-  const expiredReservations = await prisma.reservation.findMany({
-    where: {
-      status: "PENDING",
-      expiresAt: {
-        lt: new Date(),
-      },
-    },
-  });
+  try {
+    // Perform centralized robust row-locked lazy cleanup
+    await lazyCleanup();
 
-  for (const reservation of expiredReservations) {
-    await prisma.$transaction(async (tx) => {
-      const fresh = await tx.reservation.findUnique({
-        where: { id: reservation.id },
-      });
-
-      if (!fresh || fresh.status !== "PENDING") return;
-
-      await tx.stock.update({
-        where: {
-          productId_warehouseId: {
-            productId: fresh.productId,
-            warehouseId: fresh.warehouseId,
-          },
-        },
-        data: {
-          reservedUnits: {
-            decrement: fresh.quantity,
-          },
-        },
-      });
-
-      await tx.reservation.update({
-        where: { id: fresh.id },
-        data: { status: "RELEASED" },
-      });
+    return NextResponse.json({
+      success: true,
+      message: "Expired reservations released successfully",
     });
+  } catch (error) {
+    console.error("Cron job execution error:", error);
+    return NextResponse.json(
+      { error: "Cron job execution failed" },
+      { status: 500 }
+    );
   }
-
-  return NextResponse.json({
-    released: expiredReservations.length,
-  });
 }
